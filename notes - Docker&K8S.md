@@ -465,8 +465,8 @@ docker run -d -P \
     # -v my-vol:/usr/share/nginx/html \
     --mount source=my-vol,target=/usr/share/nginx/html \
     nginx:alpine
-    
-# -v        <Volume>:<dst>
+
+# -v        <dst> [<Volume>:<dst>]
 # --mount   source=<Volume>,target=<dst>[, readonly]
 
 ```
@@ -474,6 +474,7 @@ $\underline{数据卷}$是一个可供 **一个或多个** 容器使用的特殊
 - 可以在容器之间共享和重用
 - 对 **数据卷** 的修改会立马生效，且不会影响镜像
 - 默认会一直存在，即使容器被删除
+- -v 不指定宿主机 source 时，会创建临时目录 `/var/lib/docker/volumes/[VOLUME_ID]/_data` 进行挂载
  
 类似于 Linux 下对目录或文件进行 mount，**数据卷为空** 时，镜像中指定挂载数据卷会 **复制** 目录下的文件到数据卷中。
 
@@ -555,3 +556,83 @@ docker run ... \
     --dns=IP_ADDRESS                    # 设置 DNS
 ```
 如果在容器启动时没有指定最后两个参数，Docker 会默认用主机上的 `/etc/resolv.conf` 来配置容器。
+
+# 容器实现原理 —— 本质是一种特殊的进程
+ 1. 启用 Linux Namespace 配置；
+ 2. 设置指定的 Cgroups 参数；
+ 3. 切换进程的根目录（Change Root）。
+
+## 隔离 —— namespace
+容器的创建，等价于 Linux 系统调用
+```C
+# CLONE_NEWPID
+int pid = clone(main_function, stack_size, CLONE_NEWPID | SIGCHLD, NULL); 
+```
+创建容器进程时，指定了 Mount、UTS、IPC、Network 和 User 等进程 namespace 空间，每个空间内的进程 PID 从 1 开始计数（就是容器内部看到的进程列表）。
+
+**容器只是一种特殊的进程**，本质上并不是真正创建了一个“容器”。
+
+<br>
+
+## 特殊的namespace —— Mount Namespace（rootfs）
+对容器进程视图的改变，一定是伴随着挂载操作（mount）才能生效。
+
+因此容器进程启动进行 Mount Namespace 之后，需要重新挂载整个根目录“/”，文件系统才会隔离出来。
+
+就是容器镜像包含的 **rootfs**。
+
+<br>
+
+## 限制 —— Cgroups（Linux Control Group）
+
+### 作用
+ - 限制一个进程组能够使用的资源上限，包括 CPU、内存、磁盘、网络带宽等等。
+ - 对进程进行优先级设置、审计，以及将进程挂起和恢复等操作。
+
+### 使用实例
+```sh
+# 查看 /sys/fs/cgroup 路径下的 cgroup 文件
+mount -t cgroup 
+# cpuset on /sys/fs/cgroup/cpuset type cgroup (rw,nosuid,nodev,noexec,relatime,cpuset)
+# cpu on /sys/fs/cgroup/cpu type cgroup (rw,nosuid,nodev,noexec,relatime,cpu)
+# cpuacct on /sys/fs/cgroup/cpuacct type cgroup (rw,nosuid,nodev,noexec,relatime,cpuacct)
+# blkio on /sys/fs/cgroup/blkio type cgroup (rw,nosuid,nodev,noexec,relatime,blkio)
+# memory on /sys/fs/cgroup/memory type cgroup (rw,nosuid,nodev,noexec,relatime,memory)
+
+# === 给某个进程限制资源使用（如限制 pid 226的 CPU）===
+cd /sys/fs/cgroup/cpu
+
+mkdir container			# 创建子系统【container】，并会自动创建其中对应的资源文件
+ls container/
+# cgroup.clone_children cpu.cfs_period_us cpu.rt_period_us  cpu.shares notify_on_release
+# cgroup.procs      cpu.cfs_quota_us  cpu.rt_runtime_us cpu.stat  tasks
+
+# 限制 CPU 时间片为 20000 us/100000 us (20%)
+echo 20000 > /sys/fs/cgroup/cpu/container/cpu.cfs_quota_us
+cat /sys/fs/cgroup/cpu/container/cpu.cfs_period_us 
+# 100000
+
+# 限制进程号 226
+echo 226 > /sys/fs/cgroup/cpu/container/tasks 
+
+top
+# %Cpu0 : 20.3 us, 0.0 sy, 0.0 ni, 79.7 id, 0.0 wa, 0.0 hi, 0.0 si, 0.0 st
+```
+此外还支持如：
+ - blkio，为​​​块​​​设​​​备​​​设​​​定​​​I/O 限​​​制，一般用于磁盘等设备；
+ - cpuset，为进程分配单独的 CPU 核和对应的内存节点；
+ - cpu，为进程设定 CPU 的限制。
+ - memory，为进程设定内存使用的限制。
+ - ... 
+ 
+ 创建容器时直接指定Cgroups：
+```docker
+docker run -it --cpu-period=100000 --cpu-quota=20000 ubuntu /bin/bash
+```
+
+## namespace 和 Cgroups 的不足
+ - 容器是一个“单进程”模型，一个容器内无法同时运行两个不同的应用。
+ - 容器查询 /proc 的系统资源时，会返回**宿主机**的 /proc。
+   因为 /proc 文件系统不了解 Cgroups 限制的存在。
+   解决办法：把宿主机的 `/var/lib/lxcfs/proc/*` 文件挂载到容器的 `/proc/*`
+ 
