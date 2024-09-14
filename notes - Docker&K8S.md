@@ -34,6 +34,22 @@
   - [5.2. 容器互联](#52-容器互联)
   - [5.3. 容器hostname, DNS](#53-容器hostname-dns)
     - [5.3.1. 修改方式](#531-修改方式)
+- [容器实现原理 —— 本质是一种特殊的进程](#容器实现原理--本质是一种特殊的进程)
+  - [隔离 —— namespace](#隔离--namespace)
+  - [特殊的namespace —— Mount Namespace（rootfs）](#特殊的namespace--mount-namespacerootfs)
+  - [限制 —— Cgroups（Linux Control Group）](#限制--cgroupslinux-control-group)
+    - [作用](#作用)
+    - [使用实例](#使用实例)
+  - [namespace 和 Cgroups 的不足](#namespace-和-cgroups-的不足)
+    - [单进程模型](#单进程模型)
+- [K8S Api 对象](#k8s-api-对象)
+  - [Pod](#pod)
+    - [实现原理](#实现原理)
+    - [容器设计模式](#容器设计模式)
+    - [yaml](#yaml)
+      - [实例](#实例)
+      - [· initContainers](#-initcontainers)
+  - [StatefulSet](#statefulset)
 
 
 # 1. 为什么使用Docker —— 对比传统虚拟机
@@ -635,4 +651,61 @@ docker run -it --cpu-period=100000 --cpu-quota=20000 ubuntu /bin/bash
  - 容器查询 /proc 的系统资源时，会返回**宿主机**的 /proc。
    因为 /proc 文件系统不了解 Cgroups 限制的存在。
    解决办法：把宿主机的 `/var/lib/lxcfs/proc/*` 文件挂载到容器的 `/proc/*`
- 
+### 单进程模型
+容器的“单进程模型”，指的并不是一个容器里面能运行多少个进程，而是容器的生命周期以PID1为基准。
+
+即使进入后台执行其他的进程，但是主进程只要结束，容器就会退出，达不到进程分开管理的目的。
+
+--- 
+
+# K8S Api 对象
+## Pod 
+- K8S最小调度单位
+- 解决“超亲密关系”容器组的**成组调度（gang scheduling）**：包括但不限于：互相之间会发生直接的文件交换、使用 localhost 或者 Socket  文件进行本地通信、会发生非常频繁的远程调用、需要共享某些 Linux Namespace。
+
+### 实现原理
+Pod 本质上还是一组容器，但通过Join Namespace共享同一个 Network Namespace，并且可以声明共享同一个 Volume。
+
+为了能**不分先后地启动Pod内容器**，同时有一个基础的Namespace提供者，每个Pod都会先起一个Infra容器（Pause）。
+
+---
+### 容器设计模式
+与其考虑在一个容器内跑多个应用，更应该考虑设计成一个Pod内的多个容器。
+- sidecar：指的就是我们可以在一个 Pod 中，启动一个辅助容器，来完成一些独立于主进程（主容器）之外的工作
+
+### yaml
+#### 实例
+```yaml
+# 通过资源镜像 war起的InitContainer，将war资源包先行拷贝到 Pod app-volume，主进程 Tomcat 启动后直接在 app-volume 读取 war资源 来启动初始化。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: javaweb-2
+spec:
+  initContainers:
+  - image: geektime/sample:v2
+    name: war
+    command: ["cp", "/sample.war", "/app"]
+    volumeMounts:
+    - mountPath: /app
+      name: app-volume
+  containers:
+  - image: geektime/tomcat:7.0
+    name: tomcat
+    command: ["sh","-c","/root/apache-tomcat-7.0.42-v2/bin/start.sh"]
+    volumeMounts:
+    - mountPath: /root/apache-tomcat-7.0.42-v2/webapps
+      name: app-volume
+    ports:
+    - containerPort: 8080
+      hostPort: 8001 
+  volumes:
+  - name: app-volume
+    emptyDir: {}
+```
+#### · initContainers
+ - sidecar 模式的经典实现方式。
+ - 先于 Container、且按顺序启动；直到所有 InitContainer 都退出后，Container 才会启动。
+
+---
+## StatefulSet
