@@ -49,3 +49,10 @@ Events:
 `systemctl restart cri-docker.service`
 
 ---
+
+## 无法获取、操作资源
+`Error from server (Forbidden): pods "test-liveness-exec" is forbidden: node "kendev" can only delete pods with spec.nodeName set to itself`
+环境重启导致KUBECONFIG环境变量丢失，或者WORKER指定了`kubelet.conf`而非`admin.conf`，导致节点无权限
+
+重新设置KUBECONFIG
+`export KUBUCONFIG=/etc/kubernetes/admin.conf`

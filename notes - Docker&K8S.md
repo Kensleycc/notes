@@ -49,7 +49,40 @@
     - [yaml](#yaml)
       - [实例](#实例)
       - [· initContainers](#-initcontainers)
+    - [Projected Volume](#projected-volume)
+      - [secret](#secret)
+      - [ConfigMap](#configmap)
+      - [downwardAPI](#downwardapi)
+      - [Service Account Token](#service-account-token)
+    - [容器健康检查和恢复机制](#容器健康检查和恢复机制)
+      - [livenessProbe 健康检查](#livenessprobe-健康检查)
+  - [Deployment -- 实现作业副本、水平扩展](#deployment----实现作业副本水平扩展)
+    - [example](#example)
+    - [replicaSet 版本控制](#replicaset-版本控制)
+    - [滚动更新实现原理](#滚动更新实现原理)
+    - [CMD](#cmd)
   - [StatefulSet](#statefulset)
+    - [有状态应用及实现原理](#有状态应用及实现原理)
+    - [拓扑状态——Headless Service](#拓扑状态headless-service)
+    - [存储状态——Persistent Volume Claim（PVC）](#存储状态persistent-volume-claimpvc)
+    - [MySQL 主从集群实践](#mysql-主从集群实践)
+    - [StatefulSet的滚动更新](#statefulset的滚动更新)
+    - [DeamonSet -- 容器守护进程](#deamonset----容器守护进程)
+      - [工作原理](#工作原理)
+    - [ControllerRevision -- 滚动更新记录](#controllerrevision----滚动更新记录)
+    - [Job / CronJob —— 处理Batch Job](#job--cronjob--处理batch-job)
+      - [Job](#job)
+      - [Cronjob](#cronjob)
+    - [声明式API](#声明式api)
+- [K8S 存储](#k8s-存储)
+  - [PV、PVC、StorageClass](#pvpvcstorageclass)
+  - [Provision](#provision)
+  - [PV 挂载进容器 —— 两阶段处理（Attach、Mount）](#pv-挂载进容器--两阶段处理attachmount)
+    - [Attach( Dettach )](#attach-dettach-)
+    - [Mount( Unmount )](#mount-unmount-)
+  - [CSI 通用存储接口](#csi-通用存储接口)
+    - [流程](#流程)
+    - [实现](#实现)
 
 
 # 1. 为什么使用Docker —— 对比传统虚拟机
@@ -706,6 +739,497 @@ spec:
 #### · initContainers
  - sidecar 模式的经典实现方式。
  - 先于 Container、且按顺序启动；直到所有 InitContainer 都退出后，Container 才会启动。
+```yaml
+# 通过资源镜像 war起的InitContainer，将war资源包先行拷贝到 Pod app-volume，主进程 Tomcat 启动后直接在 app-volume 读取 war资源 来启动初始化。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: javaweb-2
+spec:
+  initContainers:
+  - image: geektime/sample:v2
+    name: war
+    command: ["cp", "/sample.war", "/app"]
+    volumeMounts:
+    - mountPath: /app
+      name: app-volume
+  containers:
+  - image: geektime/tomcat:7.0
+    name: tomcat
+    command: ["sh","-c","/root/apache-tomcat-7.0.42-v2/bin/start.sh"]
+    volumeMounts:
+    - mountPath: /root/apache-tomcat-7.0.42-v2/webapps
+      name: app-volume
+    ports:
+    - containerPort: 8080
+      hostPort: 8001 
+  volumes:
+  - name: app-volume
+    emptyDir: {}
+```
+
+### Projected Volume
+Projected Volume（投射数据卷），存放容器预定义的数据的对象，可如`Volume`一般挂载到 Pod 上，让 Pod 直接访问其上的数据。
+
+主要分为4类：
+ - Secret：存放加密数据，如集群数据库Credentials。
+ - ConfigMap：与secret几乎相同，存放不需要加密的数据。
+ - Downward API：让 Pod 里的容器能够直接获取到这个 Pod API 对象本身的信息。
+ - ServiceAccountToken： Kubernetes 系统内置的一种“服务账户”，它是 Kubernetes 进行权限分配的对象。
+
+#### secret
+```yaml
+# 通过k8s创建
+$ kubectl create secret generic user --from-file=./username.txt
+$ kubectl create secret generic pass --from-file=./password.txt
+
+# 通过yaml创建
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysecret
+type: Opaque
+data:
+  user: YWRtaW4=
+  pass: MWYyZDFlMmU2N2Rm # Base64 Encoded
+```
+```yaml
+spec:
+  containers:
+  - name: test-secret-volume
+    // ...
+    volumeMounts:
+    - name: mysql-cred
+      mountPath: "/projected-volume"
+      readOnly: true
+  volumes:
+  - name: mysql-cred
+    projected:
+      sources:
+      - secret:
+          name: user
+      - secret:
+          name: pass
+```
+
+#### ConfigMap
+```yaml
+apiVersion: v1
+data:
+  ui.properties: |
+    color.good=purple
+    color.bad=yellow
+    allow.textmode=true
+    how.nice.to.look=fairlyNice
+kind: ConfigMap
+metadata:
+  name: ui-config
+```
+
+#### downwardAPI
+Downward API 能够获取到的信息，一定是 Pod 里的**容器进程启动之前**就能够确定下来的信息，而不能获取**容器运行后**才会出现的信息，比如：容器进程的 PID。
+```yaml
+# 向上暴露该Pod的labels信息，作为labels文件挂载进pod的/etc/podinfo
+spec:
+  containers:
+    - name: client-container
+      volumeMounts:
+        - name: podinfo
+          mountPath: /etc/podinfo
+          readOnly: false
+  volumes:
+    - name: podinfo
+      projected:
+        sources:
+        - downwardAPI:
+            items:
+              - path: "labels"
+                fieldRef:
+                  fieldPath: metadata.labels 
+```
+```
+1. 使用 fieldRef 可以声明使用:
+spec.nodeName - 宿主机名字
+status.hostIP - 宿主机 IP
+metadata.name - Pod 的名字
+metadata.namespace - Pod 的 Namespace
+status.podIP - Pod 的 IP
+spec.serviceAccountName - Pod 的 Service Account 的名字
+metadata.uid - Pod 的 UID
+metadata.labels['<KEY>'] - 指定 <KEY> 的 Label 值
+metadata.annotations['<KEY>'] - 指定 <KEY> 的 Annotation 值
+metadata.labels - Pod 的所有 Label
+metadata.annotations - Pod 的所有 Annotation
+ 
+2. 使用 resourceFieldRef 可以声明使用:
+容器的 CPU limit
+容器的 CPU request
+容器的 memory limit
+容器的 memory request
+```
+
+#### Service Account Token
+一种特殊的`secret`，可以授权访问API Server。
+
+容器内的应用只要加载`Service Account Token`，就可以作为k8s客户端访问上层k8s server。
+
+每个Pod会默认挂载 ServiceAccountToken， 目录即：`/var/run/secrets/kubernetes.io/serviceaccount`
+```sh
+$ kubectl describe pod nginx-deployment-5c678cfb6d-lg9lw
+Containers:
+...
+  Mounts:
+    /var/run/secrets/kubernetes.io/serviceaccount from default-token-s8rbq (ro)
+Volumes:
+  default-token-s8rbq:
+  Type:       Secret (a volume populated by a Secret)
+  SecretName:  default-token-s8rbq
+  Optional:    false
+
+# 容器内查看
+$ ls /var/run/secrets/kubernetes.io/serviceaccount 
+ca.crt  namespace  token
+```
+
+Kubernetes 客户端以容器的方式运行在集群里，然后使用 `default Service Account` 自动授权的方式，被称作`“InClusterConfig”`。
 
 ---
+### 容器健康检查和恢复机制
+#### livenessProbe 健康检查
+通过检查`livenessProbe`定义的容器健康返回值，来决定**容器**当前是否处于健康状态。
+```yaml
+# 通过检查 /tmp/healthy 是否存在，来确定容器是否健康
+spec:
+  containers:
+  - name: liveness
+    image: busybox
+    args:
+    - /bin/sh
+    - -c
+    - touch /tmp/healthy; sleep 30; rm -rf /tmp/healthy; sleep 600
+    livenessProbe:
+      exec:
+        command:
+        - cat
+        - /tmp/healthy
+      initialDelaySeconds: 5 # 容器启动5s后开始
+      periodSeconds: 5       # 每隔5s执行一次
+```
+---
+
+## Deployment -- 实现作业副本、水平扩展
+### example
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  labels:
+    app: nginx
+spec:
+  # 创建 3个 pod 副本的 ReplicaSet
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.7.9
+        ports:
+        - containerPort: 80
+```
+
+---
+### replicaSet 版本控制
+Deployment 实际上是一个两层控制器。  
+首先，它通过 ReplicaSet 的个数来描述**应用的版本**；然后，它再通过ReplicaSet 的属性（比如 replicas 的值），来保证 **Pod 的副本数量**。
+
+![alt text](./picture/rollupdate.png)
+___
+### 滚动更新实现原理
+创建一个新版本的ReplicaSet，逐个收缩旧版本的 Pod，并创建新版本的 Pod，最终完成更新。
+___
+### CMD
+```sh
+# 查看 replicaset
+$ kubectl get rs
+NAME                          DESIRED   CURRENT   READY   AGE
+nginx-deployment-1764197365   2         2         2       24s
+nginx-deployment-3167673210   0         0         0       35s
+nginx-deployment-2156724341   2         2         0       7s
+```
+```sh
+# 回滚到上一版本的 ReplicaSet
+$ kubectl rollout undo deployment/nginx-deployment
+deployment.extensions/nginx-deployment
+
+# 查看 deployment 所有版本
+$ kubectl rollout history deployment/nginx-deployment
+deployments "nginx-deployment"
+REVISION    CHANGE-CAUSE
+1           kubectl create -f nginx-deployment.yaml --record
+2           kubectl edit deployment/nginx-deployment
+3           kubectl set image deployment/nginx-deployment nginx=nginx:1.91
+
+# 查看指定版本的 API 细节
+$ kubectl rollout history deployment/nginx-deployment --revision=2
+
+# 回滚到指定版本
+$ kubectl rollout undo deployment/nginx-deployment --to-revision=2
+deployment.extensions/nginx-deployment
+
+# ==================================================
+# 暂停更新，以便多次修改 deployment
+$ kubectl rollout pause deployment/nginx-deployment
+deployment.extensions/nginx-deployment paused
+
+# do something...
+
+# 继续更新
+$ kubectl rollout resume deploy/nginx-deployment
+deployment.extensions/nginx-deployment resumed
+# ==================================================
+
+```
+
 ## StatefulSet
+### 有状态应用及实现原理
+ - **拓扑状态**：实例之间存在**主次**关系，如主备。
+ - **存储状态**：实例之间绑定不同存储数据，如**主节点ID，备节点ID**
+
+StatefulSet 的核心功能，就是将网络、部署逻辑与 Pod Name（hostname）绑定，维护以上状态信息。
+
+StatefulSet 和 ReplicaSet 管理的对象都是 Pod，但是前者的 Pod 之间不再是**对等关系**。Pod 的标识信息具有了意义：  
+ - 通过 Headless Service，使每个 Pod 具有了一个 PodName 相关的 DNS 名称，从而固定了**拓扑状态**。
+ - 通过 PVC，使每个 Pod 具有了一个与 PodName 相关的 PVC，从而固定了**存储状态**。
+___
+### 拓扑状态——Headless Service
+访问 Service 有两种方式:
+ - IP 访问：Service VIP，流量会代理到任一个Pod。
+ - DNS：访问：
+   - Normal Service：指定clusterIP。  
+   `my-svc.my-namespace.svc.cluster.local` => Service VIP => 转发到代理的某一个 Pod。
+   - Headless Service：不绑定clusterIP。  
+    `my-svc.my-namespace.svc.cluster.local` => 代理的某一个 Pod。
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  ports:
+  - port: 80
+    name: web
+  # 不指定clusterIP，创建Headless Service
+  clusterIP: None
+  selector:
+    app: nginx
+```
+Headless Service 为 Pod 绑定DNS名称`<pod>.<service>.<namespace>.svc.cluster.local`，通过指定pod名称，可以直接访问对应的pod。
+
+StatefulSet 通过指定 HeadLess Service，就可以为 Pod Name 指定拓扑身份信息。
+___
+### 存储状态——Persistent Volume Claim（PVC）
+PVC 和 PV 类似【接口】和【实现】的关系。
+
+StatefulSet 可以声明绑定 PVC Template，而不是具体的Volume。此时会为每个 Pod 创建一个 PVC，并以 Pod Name 标记。
+
+当 Pod 发生变化（如删除某个Pod），PVC 和 PV **不会发生变化**。当该 Pod 恢复时，会重新分配此前 Pod Name 对应的 PVC，进而固定了存储状态与 Pod 的关系。
+
+### MySQL 主从集群实践
+使用2个initContainers和2个主Containers：  
+initContainers:
+ - init-mysql：解析当前 Pod 编号，生成含 `service-id` 的 `my.cnf` 文件，存放在 Volume 中。
+ - clone-mysql：解析当前 Pod 编号，当不存在 backup 数据且当前节点不是主节点时，请求前一个 Pod 的3307，将 xtrabackup_backup 数据保存在 Volume。  
+
+Containers：
+ - xtrabackup：做2件事情：change master、监听其他节点访问3307.
+   - 判断当前pod的mysql进程是否拉起
+   - 如果拉起，且当前节点是从节点，解析 Volume 中xtrabackup数据，拼接change master命令，丢到 MySQl中运行，并start slave
+
+ - mysql：使用volume中的my.cnf，启动mysql进程
+
+### StatefulSet的滚动更新
+修改 statefulset 的 pod 模版，就会触发滚动更新：从最后一个序号的Pod开始，逐一更新Pod。
+```sh
+$ kubectl patch statefulset mysql -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"partition":2}}}}'
+statefulset.apps/mysql patched
+```
+ - partition: 2 表示序号 >=2 的Pod才会被更新，形成**灰度发布**。
+___
+### DeamonSet -- 容器守护进程
+1. 只在特定的节点上运行Pod：可以使用NodeSelector或者NodeAffinity来限制DaemonSet的Pod只在特定的节点上运行。
+2. 根据节点的标签更新Pod：如果在集群中添加或删除了节点，Kubernetes会通过DaemonSet自动添加或删除Pod。同时，也可以通过添加或移除节点标签来更新DaemonSet中的Pod。
+3. 确保每个节点只运行一个Pod：可以使用PodAntiAffinity来确保每个节点上只有一个Pod在运行。
+4. 限制DaemonSet的Pod数量：可以使用MaxUnavailable和MaxSurge字段来限制DaemonSet的Pod的最大数量和最小数量。 
+#### 工作原理
+DaemonSet的工作原理如下：
+1. 控制器监视节点的状态：DaemonSet控制器会监视集群中的节点状态，一旦有新的节点加入集群，或者节点状态发生变化（例如节点重新启动），控制器就会触发一些操作。
+2. 创建/删除Pod：当控制器检测到节点拓扑发生变化（创建、删除节点）时，它会创建/删除一个该节点对应的Pod。
+3. 更新Pod：如果DaemonSet的配置发生变化，例如更新了镜像版本或者修改了Pod的配置文件，控制器会自动更新每个节点上的Pod实例。
+4. 扩容和缩容：DaemonSet还支持扩容和缩容，可以根据需要增加或减少Pod的数量。扩容和缩容的过程与其他控制器类似，控制器会根据指定的副本数和当前的实际Pod数量来调整Pod的数量。
+
+### ControllerRevision -- 滚动更新记录
+```yaml
+# 示例 —— 对fluented的DeamonSet进行镜像更新操作后，产生的Revision=2
+$ kubectl describe controllerrevision fluentd-elasticsearch-64dc6799c9 -n kube-system
+Name:         fluentd-elasticsearch-64dc6799c9
+Namespace:    kube-system
+Labels:       controller-revision-hash=2087235575
+              name=fluentd-elasticsearch
+Annotations:  deprecated.daemonset.template.generation=2
+              kubernetes.io/change-cause=kubectl set image ds/fluentd-elasticsearch fluentd-elasticsearch=k8s.gcr.io/fluentd-elasticsearch:v2.2.0 --record=true --namespace=kube-system
+API Version:  apps/v1
+Data:
+  Spec:
+    Template:
+      $ Patch:  replace
+      Metadata:
+        Creation Timestamp:  <nil>
+        Labels:
+          Name:  fluentd-elasticsearch
+      Spec:
+        Containers:
+          Image:              k8s.gcr.io/fluentd-elasticsearch:v2.2.0
+          Image Pull Policy:  IfNotPresent
+          Name:               fluentd-elasticsearch
+...
+Revision:                  2
+Events:                    <none>
+```
+ControllerRevision，k8s 的通用版本控制 API 对象。
+ - Data: 保存该版本API对象的完整spec信息。
+ - Annotations：保存该对象的创建语句。
+
+基于以上，k8s实现了所有对象（包括StatefulSet、DaemonSet）的更新和回滚记录。
+```sh
+# 回滚到上一个版本，Revision=1
+$ kubectl rollout undo daemonset fluentd-elasticsearch --to-revision=1 -n kube-system
+daemonset.extensions/fluentd-elasticsearch rolled back
+```
+___
+### Job / CronJob —— 处理Batch Job
+k8s 将认为作业分为2种形态：
+1. LRS（Long Running Service）长作业：如Nginx、Tomcat、MySQL
+2. Batch Jobs 批量/计算作业：如生成一个uuid的function。
+
+**Batch Jobs** 的特点是**用时创建、用后销毁**，如果用DeployMent来管理pod，会使任务不断创建、不断执行。
+
+#### Job
+```yaml
+# 计算圆周率5000位的简单脚本Pod
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pi
+spec:
+  # 并行度：允许最多2个Job Pod同时运行
+  parallelism: 2
+  # 完成度：最终需要4个[Completed]的Job Pod
+  completions: 4
+  # Job使用Pod模版
+  template:
+    spec:
+      containers:
+      - name: pi
+        image: resouer/ubuntu-bc
+        command: ["sh", "-c", "echo 'scale=5000; 4*a(1)' | bc -l "]
+      # Job只允许[ Never | Onfailure ]
+      restartPolicy: Never
+  # restart最大重试次数
+  backoffLimit: 4
+  # 每个Pod的超时时间，防止卡死或者不退出
+  activeDeadlineSeconds: 100
+```
+
+#### Cronjob
+管理 Job 的对象，类似Deployment和Pod的关系。
+```yaml
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: hello
+spec:
+  # Crontab 语法：每1分钟创建一个Job
+  schedule: "*/1 * * * *"
+  # 按时创建Job
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: hello
+            image: busybox
+            args:
+            - /bin/sh
+            - -c
+            - date; echo Hello from the Kubernetes cluster
+          restartPolicy: OnFailure
+  # 是否允许并行Job [Allow | Forbid | Replace]
+  concurrencyPolicy: Allow
+  # miss job 环比达到100个的时间窗口
+  startingDeadlineSeconds: 200
+```
+当 CronJob **创建 Job 失败**，在 [startingDeadlineSeconds] 窗口内达到**100**次（k8s写死）时，CronJob 会**停止**。
+
+### 声明式API
+一种编程接口风格，通过声明“是什么”而不是“怎么做”来描述程序的行为或状态。即通过声明对象的“期望”或“最终”状态，不关注具体实现和调谐机制，来获得相应对象。
+
+与命令式API（Imperative API）相比，声明式API更关注于描述最终状态或目标，而不是具体的步骤或过程。
+
+# K8S 存储
+## PV、PVC、StorageClass
+- PV（Persistent Volume）: 一个具体的 Volume 的属性，比如 Volume 的类型、挂载目录、远程存储服务器地址等。
+- PVC（PV Claim）：描述想要使用的PV的属性，比如存储的大小、读写权限等，K8S 会寻找满足条件的已存在可使用 PV。
+- StorageClass: **PV的模版**
+  1. 指定 PV 的 Provisioner（存储插件）。若该插件支持 Dynamic Provisioning，则 PVC 声明StorageClass，就可以动态创建所需PV进行绑定。
+  2. 只有同属于一个 StorageClass 的 PV 和 PVC 才可以绑定。
+
+## Provision
+- Static Provisioning：预先创建PV，然后分配给PVC。
+- Dynamic Provisioning：通过StorageClass动态生成PV的方式，分配给PVC。
+
+## PV 挂载进容器 —— 两阶段处理（Attach、Mount）
+### Attach( Dettach )
+- SOURCE：Master 上的 Volume Controller 维护一个控制循环 AttachDetachController
+- 过程：
+  1. 当 Pod 调度到某个节点时，AttachDetachController 会查看 Pod 的 Volume 目录（物理路径为 `/var/lib/kubelet/pods/<Pod 的 ID>/volumes/kubernetes.io~<Volume 类型 >/<Volume 名字 >`）
+  2. 将所需 Volume 与宿主机 Attach，成为宿主机上的可用磁盘。
+### Mount( Unmount )
+- SOURCE：宿主机上**独立于** kubelet 主循环的另一个Goroutine `VolumeManagerReconciler`（为了将Volume的处理与主循环解耦，避免阻塞）。
+- 过程：
+  1. 对磁盘进行预处理：如格式化等。
+  2. 将磁盘挂载到容器的指定目录。
+
+## CSI 通用存储接口
+![csi](./picture/csi.png)
+### 流程
+独立于常规 PV, PVC 的控制循环和组件，k8s 存在组件 `External Components`:
+ - External Registrar
+ - External Provisioner
+ - External Attacher
+
+通过调用 CSI 实现的 gRPC 服务（`Custom Components`），负责新 CSI Volume 类型的`Register、Provision、Attach`，进而复用节点上的 VolumeManagerReconciler 进行 `Mount。`
+
+**三阶段**处理：
+1. **Provision**: （新增）相当于创建卷。
+2. Attach
+3. Mount
+___
+### 实现
+![csi](./picture/csicode.png)
+实现以下3个 gRPC Service：
+1. CSI Identify：暴露插件的配置信息，如CSI名称等，对应 `Register`。
+2. CSI Controller：封装在Master节点上进行的管理该 CSI Volume（新的PV类型）的方法，如`创建/删除、Attach/Dettach、快照`等。
+   - CreateVolume：`Provision` 调用存储设备的API，创建一个对应的存储卷。
+   - ControllerPublishVolume：`Attach` 调用存储设备的API，讲存储卷挂载到宿主机（如Volume挂载到虚拟机中）
+3. CSI Node：封装在节点上进行的Volume操作：
+   - NodeStageVolume：`MountDevice` 步骤，在宿主机中对存储卷进行格式化，并Mount到一个临时目录（Staging）上。部分存储类型如NFS不需要格式化。
+   - NodePublishVolume：`SetUp` 步骤，将`MountDevice` 的 Staging 目录，挂载到容器 Volume 对应的目录上。
