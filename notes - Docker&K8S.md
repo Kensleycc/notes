@@ -83,6 +83,20 @@
   - [CSI 通用存储接口](#csi-通用存储接口)
     - [流程](#流程)
     - [实现](#实现)
+- [容器网络](#容器网络)
+  - [同主机容器通信](#同主机容器通信)
+  - [跨主通信](#跨主通信)
+    - [Flannel UDP / VXLAN 方案](#flannel-udp--vxlan-方案)
+      - [对比](#对比)
+    - [三层网络方案](#三层网络方案)
+      - [flannel host-gw](#flannel-host-gw)
+      - [Calico BGP](#calico-bgp)
+  - [NetworkPolicy -- 网络隔离](#networkpolicy----网络隔离)
+  - [Service -- 服务发现](#service----服务发现)
+    - [iptables、ipvs 对比](#iptablesipvs-对比)
+  - [ingress -- 外部访问 Service, "Service" 的 "Service"](#ingress----外部访问-service-service-的-service)
+    - [对外暴露 Service 问题](#对外暴露-service-问题)
+    - [ingress 核心组件](#ingress-核心组件)
 
 
 # 1. 为什么使用Docker —— 对比传统虚拟机
@@ -1009,7 +1023,7 @@ StatefulSet 和 ReplicaSet 管理的对象都是 Pod，但是前者的 Pod 之�
  - 通过 PVC，使每个 Pod 具有了一个与 PodName 相关的 PVC，从而固定了**存储状态**。
 ___
 ### 拓扑状态——Headless Service
-访问 Service 有两种方式:
+<span id="Serviceclusterip"></span>访问 Service 有两种方式:
  - IP 访问：Service VIP，流量会代理到任一个Pod。
  - DNS：访问：
    - Normal Service：指定clusterIP。  
@@ -1233,3 +1247,125 @@ ___
 3. CSI Node：封装在节点上进行的Volume操作：
    - NodeStageVolume：`MountDevice` 步骤，在宿主机中对存储卷进行格式化，并Mount到一个临时目录（Staging）上。部分存储类型如NFS不需要格式化。
    - NodePublishVolume：`SetUp` 步骤，将`MountDevice` 的 Staging 目录，挂载到容器 Volume 对应的目录上。
+
+# 容器网络
+## 同主机容器通信
+![vethpari](./picture/vethpair.png)
+通过 `Veth Pair 设备` + `宿主机网桥`的方式，实现了跟容器间的数据交换：
+1. 主机上创建 **docker0** 网桥，作为虚拟二层交换机。
+2. 每个容器建立一组虚拟网卡 `Veth Pair`，一端连接到`容器`内，另一端连接到 `docker0 网桥`。 
+3. `容器A`访问`容器B的IP`的过程：
+   1. 匹配了同网段`0.0.0.0`二层路由
+   2. 通过ARP获取目的端MAC地址
+   3. 封装二层数据帧发送到`容器A内eth0`（Veth Pair一端）。
+   4. 宿主机VethPair直连docker0网桥
+   5. docker0 **转发**二层数据包到容器B的Vethpair对应的端口（Port）。
+
+## 跨主通信
+### Flannel UDP / VXLAN 方案
+1. 容器A，B所处的虚拟机处于Flannel维护的不同子网下。
+2. 容器A向B发起IP请求，IP包通过eth0默认路由出现在(veth pair) `host docker0`：
+   - **【UDP】**：
+     1. **内核态->用户态**：通过 host 的路由规则，将IP包路由到flannel0（TUN设备，联通内核态和用户态进程（Flanneld））
+     2. `Flanneld` 根据B容器所处**子网**，在etcd 找到 `B宿主机的IP`
+     3. **将IP包封装为UDP包**
+     4. **用户态->内核态**：送回宿主机eth0走正常UDP通信到目标宿主机eth0
+     5. 目标端 `Flanneld` 解封装 -> flannel0 -> 路由到 docker0 -> (veth pair)容器内部eth0  
+    ![udp](./picture/flannel_udp.png)
+    
+   - **【VXLAN】**：
+     1. 通过 host 的路由规则，将 IP 包路由到 **源 VTEP 设备** -- `flannel.1`（虚拟隧道端点, VXLAN Tunnel EndPoint）
+     2. `flannel.1` 按照二层数据帧封装 IP 包（通过MAC寻址，需要目标VTEP的MAC）
+     3. 源VTEP充当虚拟二层网桥：通过目标VTEP的IP，查询`flannel.1设备`的ARP表，找到目标VTEP的MAC，封装为`内部数据帧`
+     4. 通过目标VTEP的MAC，查询 `flannel.1设备`的FDB数据库（转发数据库），找到目标机的IP
+      ![fdb](./picture/flannel_fdp.png)
+     5. 由 host eth0 和 ARP 表，找到目标机 MAC，LINUX 内核按照 VXLAN 机制加上 `VXLAN Header`(VNI=1, flannel.1 的1) 完成 UDP 通信帧的封装(`外部数据帧`)
+
+     6. 源eth0发送到目标eth0 -> 识别到 `VXLAN Header` -> 目标VTEP flannel.1 -> 路由 docker0 -> 容器内部eth0
+    ![vxlan](./picture/flannel_vxlan.png)
+___
+#### 对比 
+1. UDP 方案性能差，因为UDP包的封装是用户态进程 flanneld 进行的，需要额外的内核态和用户态的相互切换。
+2. 虚拟机间隧道都是用 UDP 实现，不需要考虑可靠性。可靠性由内部数据帧的内容，即容器通信的业务来控制，可以是TCP、UDP或其他。
+___
+### 三层网络方案
+#### flannel host-gw
+- 需要**宿主机间二层联通**
+- 通过路由表指向目标容器网段所在的宿主机  
+  `<dst_container_subnet> via <dst_host_ip>`
+- 不需要 `VXLAN` 等隧道协议的解封包过程，性能较好
+- 路由表在 `etcd` 中维护，flannel WATCH `etcd` 实时更新系统路由表
+![hostgw](./picture/flannel_hostgw.png)
+
+#### Calico BGP
+BGP（边界网关协议）
+- 需要宿主机间二层联通
+- 与 flannel host-gw 相同，都是通过路由指向目标
+- 通过 `BGP` 更新路由表，更新节点规模有2种：
+  - **Node-to-Node Mesh**：集群节点间两两联通交换路由，链路复杂度O(N^2)，适合小集群
+  - **Route Reflector（RR）**：选定固定的节点与其他所有节点交换路由，适合大集群
+- **不使用网桥**，所以需要给本机每一个容器设置一条指向 `Veth Pair` 的入网路由。
+
+## NetworkPolicy -- 网络隔离
+- 对 Pod 网络进行隔离
+- 本质上是 `iptables` 上的一条条规则
+- `ingress`：入网，`egress`：出网
+- 白名单，都不指定时全限
+```yaml
+apiVersion: extensions/v1beta1
+kind: NetworkPolicy
+metadata:
+  name: test-network-policy
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      role: db
+  ingress:
+   - from:
+     - namespaceSelector:
+         matchLabels:
+           project: myproject
+     - podSelector:
+         matchLabels:
+           role: frontend
+     ports:
+       - protocol: tcp
+         port: 6379
+```
+
+## Service -- 服务发现
+- 服务发现：如何通过**固定**的方式访问一个 IP 不可预知的 Pod
+- Service 由 `kube-proxy` 和 `iptables` 实现
+- Service [DNS 模式](#Serviceclusterip)：
+  - clusterIp
+  - Headless Service： `clusterIp=None`
+- Service VIP 跳转到 Pod的**工作原理**，在 `kube_proxy` 分为两种模式：
+  - iptables：在 iptables，将访问 `VIP` 的流量劫持并跳转到一组 `-mode random` 的KUBE链上，每条链指代一个 Pod，通过概率实现负载均衡
+  - ipvs：创建 `VIP` 的虚拟网卡 ipvs，并每个 Pod 绑定一个虚拟主机，使访问 `VIP` 的流量跳转到 Pod
+
+### iptables、ipvs 对比
+- iptables 使 iptables规模呈容器数量 O(N) 增长，增加了内核遍历的工作量，性能较差
+- 负载均衡策略上，iptables 支持`随机/轮询`，ipvs只是更多
+
+## ingress -- 外部访问 Service, "Service" 的 "Service"
+### 对外暴露 Service 问题
+K8s 对外暴露 Service 有3种方式：
+- NodePort：外部搭建负载均衡，将容器Port与宿主Port 绑定，缺点是**占用宿主端口**。  
+  `client --> nodeIP:nodePort --> serviceVIP:port --> podIp:targetPort`
+- LoadBalance：使用外部 lb（如:Cloud Provider）支持，缺点是**每个Service占用一个lb**
+- ingress：解决前面问题，只需**一个lb**和**一个NodePort**。
+
+### ingress 核心组件
+ - 用来给不同Service做负载均衡服务的，也就是Service的Service。
+ - 对外提供了 `域名` 到 `内部Service` 的访问链路
+ - 核心组件有3：
+   - **ingress Api**：
+     - yaml，定义域名和Service关系的规则集合 rules
+   - **ingress controller**：
+     - 负责转发的组件
+     - 动态感知集群内 Service 和 rules 的变化，更新 `lb`
+     - 对流入流量根据 rules 进行转发
+   - **反向代理负载均衡器（lb）**
+     - 常见的如：nginx、Haproxy
+     - 反向代理本体

@@ -64,6 +64,7 @@
     - [AOF 后台重写的局限性](#aof-后台重写的局限性)
     - [MP-AOF 机制](#mp-aof-机制)
     - [AOF持久化](#aof持久化)
+- [Redis 事件](#redis-事件)
 
 
 # Redis 数据结构
@@ -631,5 +632,24 @@ ___
   5. 期间的脏数据继续写入新`INCR`，无需再写入`aof_rewrite_buf`。
   6. 重写完成后，`新BASE`和`新INCR`代表了此刻Redis的全部数据。
   7. 主进程原子更新`manifest`：
-      - 将旧`BASE`和`INCR`标记为`HISTORY`，等待删除。
-      - 将`新BASE`和`新INCR`追加进来。
+      - 将`旧BASE, INCR`标记为`HISTORY`，等待删除。
+      - 将`新BASE, INCR`追加进来。
+
+# Redis 事件
+```python
+def eventLoop:
+  # ...
+
+  # 最多阻塞一个最近的时间事件，直到有文件事件可用
+  timeval = aeSearchNearestTimeEv()
+  aeApiPoll(timeval)
+
+  processFileEvent()
+
+  processTimeEvent()
+  #...
+```
+- Redis eventLoop是Reactor模式的事件驱动模型。
+- 每个 Loop 轮流处理 `fileEvent` 和 `tiemEvent`
+- 如果当前**没有文件事件**，最多会阻塞一个`最近时间事件`的时间差值，直到**阻塞结束**或者**有文件事件**到来。
+
