@@ -97,6 +97,21 @@
   - [ingress -- 外部访问 Service, "Service" 的 "Service"](#ingress----外部访问-service-service-的-service)
     - [对外暴露 Service 问题](#对外暴露-service-问题)
     - [ingress 核心组件](#ingress-核心组件)
+- [资源模型](#资源模型)
+  - [可压缩 / 不可压缩资源](#可压缩--不可压缩资源)
+  - [QoS class](#qos-class)
+  - [资源回收（Eviction）](#资源回收eviction)
+  - [cpuset -- 核心独占](#cpuset----核心独占)
+  - [DaemonSet 最佳实践 -- Guaranteed](#daemonset-最佳实践----guaranteed)
+- [资源调度](#资源调度)
+  - [调度原理](#调度原理)
+  - [调度策略](#调度策略)
+    - [Predicates 预选](#predicates-预选)
+    - [Priorities 优选](#priorities-优选)
+  - [调度抢占（Preemtion）](#调度抢占preemtion)
+    - [调度队列原理](#调度队列原理)
+    - [抢占流程](#抢占流程)
+    - [潜在抢占时的双预选（Predicates）](#潜在抢占时的双预选predicates)
 
 
 # 1. 为什么使用Docker —— 对比传统虚拟机
@@ -1369,3 +1384,100 @@ K8s 对外暴露 Service 有3种方式：
    - **反向代理负载均衡器（lb）**
      - 常见的如：nginx、Haproxy
      - 反向代理本体
+
+# 资源模型
+## 可压缩 / 不可压缩资源
+Pod 的占用资源分为两类：
+- 可压缩资源：如 CPU；不足时，Pod 会“饥渴”
+- 不可压缩资源：如内存；不足时，Pod 会被 OOM
+
+## QoS class
+Pod 的 Container 资源定义上，可以设置 `limit` 和 `requests`
+- limits: 容器可分配的最大资源，通过设置 `Cgroups` 实现
+- requests: 容器**调度**时，`kube-scheduler` 计算使用的资源值
+
+QoS（服务质量等级）：
+
+Pod 存在 `qos_class` 属性：
+ - Guaranteed（Pod 内**所有的容器**都满足条件）: 容器仅设置 `limits`，或 `requests = limit`。
+ - BestEffort：**所有的容器**都没有设置 `limits` 和 `requests`
+ - Burstable：至少一个容器设置了 `requests`。
+
+## 资源回收（Eviction）
+当不可压缩资源不足时，根据 `Eviction 模式`，和 Pod 的 `qos_class`，删除Pod：
+- Soft Eviction：达到阈值一定时间（`--eviction-soft-grace-period=imagefs.available=2m，2分钟`）时，触发 `Eviction`
+- Hard Eviction：达到阈值时马上触发 `Eviction`
+
+删除 Pod 的顺序参考 qos_class：  
+`BestEffort -> Burstable -> Guaranteed`
+
+## cpuset -- 核心独占
+设置 CPU 资源为 Guaranteed 形式，可以让 Pod 独占核心，可以减少核心交换损耗，同时别的 Pod 不会被调度到相应的核心上。
+
+## DaemonSet 最佳实践 -- Guaranteed
+DaemonSet 最好都设置为 `Guaranteed`，否则  `Eviction -> 拉起 -> Eviction`，形成循环。
+
+# 资源调度
+## 调度原理
+**调度**：为 Pod 选择最合适的节点运行起来。
+![scheduler](./picture/pod_scheduler.png)
+
+1. 调度主要依靠两个控制循环：`Informer Path` 和 `Scheduling Path`:
+2. Informer Path: 基于一系列 `Informer`，持续监听（Watch）Etcd 中 API 对象的**变化**。如 `Pod Informer` 会将新 Pod 入队 `Priority Q`，等待调度分配。
+3. Scheduling Path: Pod 调度的**主循环**。持续出队 `Priority Q` 的 Pod，执行 `Predicates -> Priorities -> Bind` 流程，完成调度：
+   - `Predicates（预选）`: 运行一系列的算法，检查 Pod 在各个 Node 上是否可以运行。
+   - `Priorities（优选）`: 运行一系列的算法，为 `Predicates` 筛选的节点进一步打分，分高者为目标调度 Node。
+   - `Bind`: 将 Pod 的 nodeName 修改为目标节点。
+   - *`Assume（乐观绑定）`：为保证不直接访问 APIServer 执行 Pod 生命周期等耗时操作，这一步只会更新 Scheduler Cache 里的 Pod 和 Node 的信息。会有另一个 Goroutine 向 APIServer 发起更新 Pod 的请求。
+   - *`Admit`: 由于`乐观绑定`的延时性，在 Node 实际启动 Pod 时，kubelet 会进行 `Admit`，**二次确认** Pod 当前是否可以运行。主要执行 `Predicates` 的 `GeneralPredicates`。
+
+## 调度策略
+- **Cache 化**：**K8s 高性能调度的关键**。Predicates、Priorities、Bind 过程中对各节点执行算法所需的节点信息都会保存在 `Scheduler Cache` 中，提高效率。
+- **乐观绑定**：Bind 实际上执行 Assume 的流程。
+- **无锁化**：调度的并发路径上会避免加锁竞争资源的设计和使用，只有对**调度队列**和 **Scheduler Cache** 进行操作时，才需要加锁，这些都不在并发路径上: 
+  - `Predicates` 是多 Goroutine **并发**执行
+  - `Priorities` 会以 MapReduce 的方式**并行**计算然后再进行汇总
+
+### Predicates 预选
+- 16 个 Goroutine 并发所有 Node 计算 Predicates
+- 4个层次的`Predicates`依次进行，基础的不满足，后续的跳过：
+  1. 资源、seletor 等
+  2. 存储
+  3. 宿主机相关，如 Taint
+  4. Pod 相关，如亲和/反亲和 PodAffinity
+___
+### Priorities 优选
+对 `Predicates` 过滤的节点进行打分，得分最高就是待绑定的最佳节点。
+## 调度抢占（Preemtion）
+### 调度队列原理
+- activeQ：
+  - 存放下一个调度周期需要调度的对象。
+  - Scheduler 循环在该 Q 出队一个 Pod，并执行 `双P调度(Predicates, Priorities)`
+- unscheduelableQ： 
+  - 存放所有调度失败的 Pod
+  - uQ 内的 Pod **更新**后，会重新进入 activeQ
+___
+### 抢占流程
+1. 失败：Pod 调度失败，进入 `uQ`，并**触发**抢占流程
+2. 复盘：检查失败的原因，判断抢占可以解决问题。（如非 nodeSelector 不匹配这种**无法解决**的问题）
+3. 模拟：抢占可以发生，复制一份 node 信息，模拟抢占过程：
+   1. 遍历所有 node
+   2. 每个 node 上的 Pod 按照优先级从小到大删除，直到 `抢占者` 可以在此 node 运行
+   3. 记录该 node 和所需的 `牺牲者(victims)` 列表
+   4. 按照`最小影响原则`：“尽可能少牺牲者，尽可能低优先级的牺牲者”，选择**最佳抢占节点**
+4. 牺牲：
+   1. `调度器`检查牺牲者列表，删除牺牲者的`nominatedNodeName` 字段
+   2. 另起一个 Goroutine，同步删除该牺牲者。
+5. 预抢占：**更新**抢占者的`nominatedNodeName`。  
+   - 这一步会触发 uQ 内Pod被更新的机制，抢占者重新进入activeQ，**等待下一轮**调度。
+   - 仅作为“潜在的抢占者”，下一轮调度可能成功、可能失败。
+___
+### 潜在抢占时的双预选（Predicates）
+- 调度过程中，Pod 将要预选计算的 node 如果存在被抢占者，则会触发`双预选`机制：
+  - activeQ 中存在潜在抢占者
+  - 抢占 node 和当前 Pod 判断预选的 node 相同
+- 执行两次**预选**：
+  1. Scheduler 假设（with）抢占者**已经存在**于此 node，判断该 Pod 能否调度：
+      - InterPodAntiAffinity Pod 互斥关系之类的规则
+  2. Scheduler 假设（without）抢占者**无法存在**于此 node，即正常的 `Predicates`：
+      - inter-pod Affinity Pod亲和之类的规则
