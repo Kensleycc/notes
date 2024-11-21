@@ -65,6 +65,18 @@
     - [MP-AOF 机制](#mp-aof-机制)
     - [AOF持久化](#aof持久化)
 - [Redis 事件](#redis-事件)
+- [Redis 集群](#redis-集群)
+  - [复制（Replicate）](#复制replicate)
+    - [旧复制（\< Redis 2.8）](#旧复制-redis-28)
+      - [流程](#流程)
+      - [弊端](#弊端)
+    - [新复制](#新复制)
+  - [Sentinel](#sentinel)
+    - [故障转移](#故障转移)
+  - [Redis Cluster](#redis-cluster)
+    - [槽（slot）指派](#槽slot指派)
+    - [重新分片](#重新分片)
+    - [故障转移](#故障转移-1)
 
 
 # Redis 数据结构
@@ -652,4 +664,91 @@ def eventLoop:
 - Redis eventLoop是Reactor模式的事件驱动模型。
 - 每个 Loop 轮流处理 `fileEvent` 和 `tiemEvent`
 - 如果当前**没有文件事件**，最多会阻塞一个`最近时间事件`的时间差值，直到**阻塞结束**或者**有文件事件**到来。
+
+# Redis 集群
+## 复制（Replicate）
+从节点通过 `SLAVEOF` 与主节点形成 **主从复制集群**。
+### 旧复制（< Redis 2.8）
+#### 流程
+- **复制（sync）**：
+  - 执行 `BGSAVE` 生成 RDB 文件，作为全量数据
+  - 同时开启一个 `缓冲区`，记录 RDB 过程中执行的写命令
+  - `BGSAVE` 完成后，将 RDB 和缓冲区的命令都发给从节点，使之数据恢复至主节点一致的状态
+- **命令传播（propagate）**：将主节点上的所有写命令同步到从节点，保持增量同步
+
+#### 弊端
+- 断线重复制（Resynchronize）：当从节点同步中断后重连，需要主节点重新进行复制步骤，同步**全量的 RDB 文件。**
+___
+### 新复制
+- **复制（PSYNC）**：分为两种形式：
+  - **完整重同步（full resync）**：等同于**旧复制的SYNC**，用于**初次同步**和重连后**无法部分重同步**的情况。
+  - **部分重同步（partial resync）**：仅同步断线过程中从节点落后的部分数据，基于以下实现：
+    - 主、从节点维护**复制偏移量（replication offset）**，和**节点ID（run id）**
+    - 主节点新增**复制缓冲区（replication backlog）**，不断暂存同步给从节点的最新数据
+![backlog](./picture/redis/replicationbacklog.png)
+    - 当从节点断线重连，
+      1. 会校验当前主节点是否是此前的主节点（run ID）
+      2. 然后计算两者的数据差异（复制偏移量）
+      3. 如果差异的数据依然暂存于复制缓冲区，则触发部分重同步。
+      4. 否则，触发完整重同步。
+
+___
+## Sentinel
+Redis 的一种高可用**一主多从**集群方案。
+![sentinalfailover](./picture/redis/sentinelfailover.png)
+
+通过一系列以 `--Sentinel` 启动的特殊 `Redis sentinel system`，监视**一主多从** Redis 集群，实现故障转移，构成 Redis 高可用集群。
+
+### 故障转移
+- 主观下线：某 Sentinel_1 发现主节点失联：
+  - 每秒 PING 命令累计不通 `down_after_milliseconds`
+- 客观下线：Sentinel_1 向其他 Sentinel 确认主节点是否失联：
+  - 超过 `quorum` 个数的 Sentinel 回复失联
+- 选举 Sentinel Leader：
+  - 进行多轮共识，维护一个自增计数器**配置纪元（configuration epoch）** 用于标识同一轮次
+  - 每轮发现 `客观下线` 的 Sentinel 都会要求成为 leader，向其他 Sentinel 发送 `is_master_down_by_addr`(确认客观下线相同的命令)，并设置其中的 `run_ID` 和 `epoch`
+  - 从 Sentinel 每轮只响应第一个接受到的（先到先得）选举请求，确认一个 Sentinel leader
+  - 当某一个 Sentinel 在某轮中或者超过半数的投票，则成为 leader
+- Leader 执行故障转移：
+  - 在剩余可达的从节点中，按照优先级选出新主
+  - 执行 `SLAVE NO ONE` 提升为主节点
+  - 修改从节点指向新主
+  - 修改旧主为从节点：保存在旧主的 server 实例结构，等待重新上线时应用。
+___
+## Redis Cluster
+Redis 分布式方案。
+![cluster](./picture/redis/rediscluster.png)
+
+- 集群模式启动：`cluster-enabled` 配置
+- 组建命令：`CLUSTER MEET <ip> <port>`
+- **只能使用** 0 号数据库
+
+### 槽（slot）指派
+CLUSTER 主节点通过指定保存 Redis 共 `16384个` 数据槽中的哪一部分（0~16384），实现集群整体**数据分片**。
+
+- 集群状态：
+  - ok：16384个槽均有指派
+  - fail：有槽下线
+- 命令：`CLUSTER ADDSLOTS <slot...>`
+- 节点会保存所有节点的槽指派情况，当查询所需的数据：
+  - 在自己的槽上，直接执行
+  - 不在自己槽上，返回 `MOVED` 错误，**集群模式**的客户端会直接重定向至槽所在的节点
+- KEY 分片算法：`CRC16(key) & 16384` (&快速取模)
+
+### 重新分片
+![reshard](./picture/redis/resharding.png)
+
+### 故障转移
+- 从节点指向主节点：`CLUSTER REPLICATE <master_ip> <master_port>`
+- 故障检测：
+  - 节点间定期互 PING 和互相交换信息，PING不通标记对方为 `可能下线（PFAIL）`
+  - 主节点收到某个主节点关于主节点的 PFAIL 时，会记录一份 `fail_reports`
+  - 当某个主节点收到超过半数主节点的 `fail_reports` 指向某个主节点下线，则认为该主节点已下线（FAIL）
+  - 广播 FAIL 到所有节点
+- 故障转移：
+  - 广播选主：收到**自己主节点** FAIL 的从节点，广播 `CLUSTER_TYPE_FAILOVER_AUTH_REQUEST`
+  - 主节点投票：所有主节点有权投票选主，在每一个配置纪元选择一个从节点
+  - 当有半数主节点选择同一从节点，该从节点成为新主
+  - 新主撤销旧主的槽指派，并指向自己
+  - 广播 `PONG` 表示转移成功，所有节点更新槽指派信息
 
