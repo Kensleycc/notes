@@ -46,6 +46,7 @@
   - 事务型：
     - `enable.idempotence=true`
     - `生产者设置 transactional.id`
+    - 跨分区事务型：确保所有分区接受消息的原子性
 
 ### 分区器、分区策略
 生产者的消息应发往哪一个 Partition
