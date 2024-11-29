@@ -98,6 +98,15 @@ ___
   2. 订阅的 Partition 增加
   3. 匹配新的 Topic
 ___
+## Partition 存储结构
+![partitionstorage](./picture/interview/partitionStorage.png)
+- Kafka 预留一片内存，在内存内**追加写入**持久化信息
+- 每一个Partition = `文件夹`
+- Partition 下分为多个 `segment1, segment2...`
+- 每个 segment 由3部分组成：
+  - .log：存放消息实体，包括offset、消息体等
+  - .index：
+___
 # 消息推送模式
 ## 推拉模式
 ![pushpull](./picture/kafka/pushpull.png)
