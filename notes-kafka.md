@@ -104,8 +104,10 @@ ___
 - 每一个Partition = `文件夹`
 - Partition 下分为多个 `segment1, segment2...`
 - 每个 segment 由3部分组成：
+  ![message](./picture/interview/messageFile.png)
   - .log：存放消息实体，包括offset、消息体等
-  - .index：
+  - .index：存放 `message offset` 到 `log 内信息物理偏移` 的稀疏索引
+  - .timeIndex：（>= 0.10.0.0）按照`消息时间戳`来索引消息
 ___
 # 消息推送模式
 ## 推拉模式

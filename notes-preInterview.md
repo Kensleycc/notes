@@ -23,6 +23,7 @@
 
 - Map 原理 rehash 怎么回事
 - sync.Map 原理
+- sync.Pool
 - 内存泄漏 以及修复方式
 - 逃逸分析
 
